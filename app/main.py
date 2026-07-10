@@ -33,6 +33,7 @@ async def main() -> None:
             BotCommand(command="status", description="Текущие лимиты"),
             BotCommand(command="next", description="Когда обнуление"),
             BotCommand(command="models", description="Доступные модели"),
+            BotCommand(command="myid", description="Показать мой user_id"),
         ]
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())

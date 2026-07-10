@@ -136,9 +136,24 @@ async def _models_text() -> str:
 
 # ── Команды ──────────────────────────────────────────────────────────────────
 
+@router.message(Command("myid"))
+async def cmd_myid(message: Message) -> None:
+    """Показать свой user_id (для настройки ALLOWED_USER_IDS)."""
+    uid = message.from_user.id if message.from_user else "?"
+    log.info("myid request from user_id=%s chat=%s", uid, message.chat.id)
+    await message.answer(f"Твой user_id: <code>{uid}</code>", parse_mode="HTML")
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
+    uid = message.from_user.id if message.from_user else "?"
+    log.info("start from user_id=%s chat_id=%s type=%s", uid, message.chat.id, message.chat.type)
     if not _allowed_message(message):
+        await message.answer(
+            f"Твой user_id: <code>{uid}</code>\n"
+            "Добавь его в ALLOWED_USER_IDS, чтобы команды работали в личке.",
+            parse_mode="HTML",
+        )
         return
     await message.answer(
         "Бот следит за лимитами <b>Claude</b> 🟣 и <b>Codex</b> 🟠 и шлёт push при "
