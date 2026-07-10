@@ -6,7 +6,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, MenuButtonCommands
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .config import settings
@@ -26,7 +26,7 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Команды в синем меню Telegram-клиента.
+    # Команды в меню + кнопка меню [☰] слева от поля ввода (всегда доступна).
     await bot.set_my_commands(
         [
             BotCommand(command="menu", description="Меню с кнопками"),
@@ -35,6 +35,7 @@ async def main() -> None:
             BotCommand(command="models", description="Доступные модели"),
         ]
     )
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
     state = State(settings.state_path)
     state.load()

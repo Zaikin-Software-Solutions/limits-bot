@@ -80,7 +80,7 @@ def _window_line(label: str, w) -> str:
 
 def format_status(creds: list[Credential]) -> str:
     if not creds:
-        return "Нет аккаунтов в ответе API."
+        return "Нет аккаунтов (источник недоступен или отфильтрован)."
     lines: list[str] = []
     for c in creds:
         tier = f" ({c.rate_limit_tier})" if c.rate_limit_tier else ""
@@ -133,16 +133,28 @@ def format_next(creds: list[Credential]) -> str:
     return "\n".join(out)
 
 
-def format_models(model_ids: list[tuple[str, str]]) -> str:
-    """Список моделей, сгруппированный по провайдеру. model_ids = [(owner, id), ...]."""
+def _models_block(title: str, model_ids: list[tuple[str, str]], err: str | None) -> list[str]:
+    """Блок одного прокси: заголовок + модели по owner, либо ошибка."""
+    if err:
+        return [f"<b>{title}</b>", f"  ⚠️ {err}"]
     if not model_ids:
-        return "Не удалось получить список моделей."
+        return [f"<b>{title}</b>", "  (пусто)"]
     by_owner: dict[str, list[str]] = {}
     for owner, mid in sorted(model_ids):
         by_owner.setdefault(owner, []).append(mid)
-    out = [f"<b>Доступно моделей: {len(model_ids)}</b>"]
+    out = [f"<b>{title}</b> · {len(model_ids)} шт"]
     for owner, ids in by_owner.items():
-        out.append(f"\n<b>{owner}</b>")
-        for mid in ids:
-            out.append(f"  • <code>{mid}</code>")
-    return "\n".join(out)
+        out.append(f"  <u>{owner}</u>: " + ", ".join(f"<code>{m}</code>" for m in ids))
+    return out
+
+
+def format_models_split(
+    rodionov: tuple[list[tuple[str, str]], str | None],
+    zspzvs: tuple[list[tuple[str, str]], str | None],
+) -> str:
+    """Модели двух прокси раздельно. Каждый аргумент = (список, текст-ошибки|None)."""
+    lines: list[str] = ["🤖 <b>Доступные модели</b>", ""]
+    lines += _models_block("🟣 rodionov (Claude/Gemini)", rodionov[0], rodionov[1])
+    lines.append("")
+    lines += _models_block("🟠 zspzvs (Codex/OpenAI)", zspzvs[0], zspzvs[1])
+    return "\n".join(lines)

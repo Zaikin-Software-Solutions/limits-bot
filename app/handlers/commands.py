@@ -1,4 +1,8 @@
-"""Входящие команды и inline-меню: /start, /menu, /status, /next, /models."""
+"""Входящие команды и меню: /start, /menu, /status, /next, /models.
+
+Плитки inline-меню разделены по провайдеру: отдельно 🟣 Claude, 🟠 Codex и «Всё».
+Постоянная reply-клавиатура внизу + Menu Button слева от ввода (ставится в main).
+"""
 
 from __future__ import annotations
 
@@ -17,31 +21,38 @@ from aiogram.types import (
 )
 
 from ..config import settings
-from ..formatter import format_models, format_next, format_status
-from ..limits_api import fetch_limits, fetch_models
+from ..formatter import format_models_split, format_next, format_status
+from ..limits_api import Credential, fetch_limits, fetch_models
 
 log = logging.getLogger(__name__)
 router = Router()
 
 
+# ── Клавиатуры ───────────────────────────────────────────────────────────────
+
 def _menu_kb() -> InlineKeyboardMarkup:
-    """Inline-меню с командами (под сообщением)."""
+    """Inline-меню: по строке на действие, в каждой — Claude / Codex / Всё."""
+    def row(action: str, title: str) -> list[InlineKeyboardButton]:
+        return [
+            InlineKeyboardButton(text=f"{title}", callback_data=f"cmd:{action}:all"),
+            InlineKeyboardButton(text="🟣", callback_data=f"cmd:{action}:claude"),
+            InlineKeyboardButton(text="🟠", callback_data=f"cmd:{action}:codex"),
+        ]
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            row("status", "📊 Статус"),
+            row("next", "⏰ Обнуление"),
             [
-                InlineKeyboardButton(text="📊 Статус", callback_data="cmd:status"),
-                InlineKeyboardButton(text="⏰ Обнуление", callback_data="cmd:next"),
-            ],
-            [
-                InlineKeyboardButton(text="🤖 Модели", callback_data="cmd:models"),
-                InlineKeyboardButton(text="🔄 Обновить", callback_data="cmd:menu"),
+                InlineKeyboardButton(text="🤖 Модели", callback_data="cmd:models:all"),
+                InlineKeyboardButton(text="🔄 Обновить", callback_data="cmd:menu:all"),
             ],
         ]
     )
 
 
 def _reply_kb() -> ReplyKeyboardMarkup:
-    """Постоянная клавиатура внизу поля ввода — кнопки-команды всегда под рукой."""
+    """Постоянная клавиатура внизу поля ввода."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 Статус"), KeyboardButton(text="⏰ Обнуление")],
@@ -51,6 +62,8 @@ def _reply_kb() -> ReplyKeyboardMarkup:
         is_persistent=True,
     )
 
+
+# ── Доступ ───────────────────────────────────────────────────────────────────
 
 def _allowed_chat(chat_id: int) -> bool:
     return chat_id == settings.chat_id
@@ -68,39 +81,57 @@ def _allowed_message(message: Message) -> bool:
     return message.from_user is not None and _allowed_user(message.from_user.id)
 
 
-async def _load_creds():
-    resp = await fetch_limits(settings.limits_api_url, settings.limits_token)
-    creds = resp.credentials
+# ── Данные ───────────────────────────────────────────────────────────────────
+
+async def _gather() -> list[Credential]:
+    """Аккаунты из всех источников (claude + опц. codex), с провайдером."""
+    out: list[Credential] = []
+    try:
+        r = await fetch_limits(settings.limits_api_url, settings.limits_token, provider="claude")
+        out.extend(r.credentials)
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("gather claude failed: %s", e)
+    if settings.codex_api_url and settings.codex_token:
+        try:
+            r = await fetch_limits(settings.codex_api_url, settings.codex_token, provider="codex")
+            out.extend(r.credentials)
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("gather codex failed: %s", e)
     if settings.accounts_filter:
-        creds = [c for c in creds if c.email in settings.accounts_filter]
+        out = [c for c in out if c.email in settings.accounts_filter]
+    return out
+
+
+def _filter(creds: list[Credential], scope: str) -> list[Credential]:
+    if scope in ("claude", "codex"):
+        return [c for c in creds if c.provider == scope]
     return creds
 
 
-async def _status_text() -> str:
-    try:
-        creds = await _load_creds()
-    except (httpx.HTTPError, ValueError) as e:
-        log.warning("status fetch failed: %s", e)
-        return "Не удалось получить лимиты (API недоступен)."
+async def _status_text(scope: str = "all") -> str:
+    creds = _filter(await _gather(), scope)
     return format_status(creds)
 
 
-async def _next_text() -> str:
-    try:
-        creds = await _load_creds()
-    except (httpx.HTTPError, ValueError) as e:
-        log.warning("next fetch failed: %s", e)
-        return "Не удалось получить лимиты (API недоступен)."
+async def _next_text(scope: str = "all") -> str:
+    creds = _filter(await _gather(), scope)
     return format_next(creds)
 
 
 async def _models_text() -> str:
-    try:
-        models = await fetch_models(settings.limits_api_url, settings.limits_token)
-    except (httpx.HTTPError, ValueError) as e:
-        log.warning("models fetch failed: %s", e)
-        return "Не удалось получить список моделей."
-    return format_models(models)
+    """Модели двух прокси раздельно: rodionov (claude-url) и zspzvs (codex-url)."""
+    async def grab(url: str, token: str):
+        if not url or not token:
+            return [], "источник не настроен"
+        try:
+            return await fetch_models(url, token), None
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("models fetch failed for %s: %s", url, e)
+            return [], "недоступен"
+
+    rodionov = await grab(settings.limits_api_url, settings.limits_token)
+    zspzvs = await grab(settings.codex_api_url, settings.codex_token)
+    return format_models_split(rodionov, zspzvs)
 
 
 # ── Команды ──────────────────────────────────────────────────────────────────
@@ -110,19 +141,19 @@ async def cmd_start(message: Message) -> None:
     if not _allowed_message(message):
         return
     await message.answer(
-        "Бот следит за лимитами <b>Claude</b> и <b>Codex</b> и шлёт push при обнулении "
-        "недельного окна, порогах утилизации, платном overflow и полной блокировке.\n\n"
-        "Кнопки всегда внизу. Или /menu, /status, /next, /models.",
+        "Бот следит за лимитами <b>Claude</b> 🟣 и <b>Codex</b> 🟠 и шлёт push при "
+        "обнулении недельного окна, порогах утилизации, overflow и блокировке.\n\n"
+        "Кнопки внизу и слева (☰). В inline-меню 🟣/🟠 — отдельный провайдер.",
         parse_mode="HTML",
         reply_markup=_reply_kb(),
     )
+    await message.answer("Выбери действие:", reply_markup=_menu_kb())
 
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message) -> None:
     if not _allowed_message(message):
         return
-    # показываем и постоянную клавиатуру, и inline-меню
     await message.answer("Меню limits-bot:", reply_markup=_reply_kb())
     await message.answer("Выбери действие:", reply_markup=_menu_kb())
 
@@ -132,7 +163,7 @@ async def cmd_menu(message: Message) -> None:
 async def cmd_status(message: Message) -> None:
     if not _allowed_message(message):
         return
-    await message.answer(await _status_text(), parse_mode="HTML", reply_markup=_menu_kb())
+    await message.answer(await _status_text("all"), parse_mode="HTML", reply_markup=_menu_kb())
 
 
 @router.message(Command("next"))
@@ -140,7 +171,7 @@ async def cmd_status(message: Message) -> None:
 async def cmd_next(message: Message) -> None:
     if not _allowed_message(message):
         return
-    await message.answer(await _next_text(), parse_mode="HTML", reply_markup=_menu_kb())
+    await message.answer(await _next_text("all"), parse_mode="HTML", reply_markup=_menu_kb())
 
 
 @router.message(Command("models"))
@@ -158,7 +189,7 @@ async def btn_menu(message: Message) -> None:
     await message.answer("Выбери действие:", reply_markup=_menu_kb())
 
 
-# ── Inline-кнопки ────────────────────────────────────────────────────────────
+# ── Inline-кнопки: cmd:<action>:<scope> ──────────────────────────────────────
 
 @router.callback_query(F.data.startswith("cmd:"))
 async def on_menu_click(cb: CallbackQuery) -> None:
@@ -167,15 +198,17 @@ async def on_menu_click(cb: CallbackQuery) -> None:
         await cb.answer("Нет доступа.", show_alert=True)
         return
 
-    action = cb.data.split(":", 1)[1]
-    await cb.answer()  # убрать «часики» на кнопке
+    parts = cb.data.split(":")
+    action = parts[1] if len(parts) > 1 else "menu"
+    scope = parts[2] if len(parts) > 2 else "all"
+    await cb.answer()  # убрать «часики»
 
     if action == "menu":
-        text = "Меню limits-bot:"
+        text = "Выбери действие:"
     elif action == "status":
-        text = await _status_text()
+        text = await _status_text(scope)
     elif action == "next":
-        text = await _next_text()
+        text = await _next_text(scope)
     elif action == "models":
         text = await _models_text()
     else:
