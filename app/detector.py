@@ -72,6 +72,20 @@ def _crossed(prev: float | None, cur: float | None, threshold: float) -> bool:
     return p < threshold <= cur
 
 
+def has_limits_data(cred: Credential) -> bool:
+    """True, если API вернул реальные окна лимитов (а не null из-за upstream 429).
+
+    rotate-proxy кэширует usage; при протухшем кэше и rate-limit на upstream он
+    отдаёт five_hour/seven_day = null. Такой ответ НЕ должен затирать снапшот и
+    не должен порождать события.
+    """
+    sd = cred.limits.seven_day
+    fh = cred.limits.five_hour
+    return (sd is not None and sd.utilization_pct is not None) or (
+        fh is not None and fh.utilization_pct is not None
+    )
+
+
 def snapshot_of(cred: Credential) -> dict[str, Any]:
     """Собрать текущий снапшот аккаунта (без notified_flags — их мержим отдельно)."""
     sd = cred.limits.seven_day
@@ -94,7 +108,16 @@ def detect(
     weekly_warn_hours: float,
     extra_usage_warn_pct: float,
 ) -> tuple[list[Event], dict[str, Any]]:
-    """Вернуть (события, новый снапшот-аккаунта с обновлёнными notified_flags)."""
+    """Вернуть (события, новый снапшот-аккаунта с обновлёнными notified_flags).
+
+    Если API вернул пустые лимиты (upstream 429) — сохраняем прошлый снапшот как
+    есть, событий не шлём: пустышка не должна выглядеть как «обнулилось».
+    """
+    if not has_limits_data(cred):
+        keep = dict(prev)
+        keep["last_seen_at"] = _iso(_now())
+        return [], keep
+
     events: list[Event] = []
     cur = snapshot_of(cred)
     name = cred.name

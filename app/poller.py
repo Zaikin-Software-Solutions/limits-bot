@@ -8,7 +8,7 @@ import httpx
 from aiogram import Bot
 
 from .config import settings
-from .detector import detect
+from .detector import detect, has_limits_data
 from .limits_api import fetch_limits
 from .state import State
 
@@ -26,6 +26,11 @@ async def poll_once(bot: Bot, state: State) -> None:
     creds = resp.credentials
     if settings.accounts_filter:
         creds = [c for c in creds if c.email in settings.accounts_filter]
+
+    empty = [c.email for c in creds if not has_limits_data(c)]
+    if empty:
+        # upstream 429 → лимиты пустые; снапшот не затираем, но полезно видеть в логах.
+        log.info("poll: empty limits (upstream rate-limit) for: %s", ", ".join(empty))
 
     first_run = state.is_fresh
     all_events = []

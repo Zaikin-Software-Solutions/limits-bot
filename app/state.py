@@ -41,8 +41,16 @@ class State:
 
     @property
     def is_fresh(self) -> bool:
-        """True, если снапшота ещё не было (первый запуск) — тогда события не шлём."""
-        return not self._data["accounts"]
+        """True, пока не зафиксирован baseline с РЕАЛЬНЫМИ данными.
+
+        Пустые ответы (upstream 429 → seven_day/five_hour = null) сохраняются, но
+        не считаются baseline: первое настоящее сравнение — с первым непустым
+        снапшотом, иначе на переходе null→числа прилетит ложное событие.
+        """
+        for acc in self._data["accounts"].values():
+            if acc.get("seven_day_pct") is not None or acc.get("five_hour_pct") is not None:
+                return False
+        return True
 
     def account(self, email: str) -> dict[str, Any]:
         return self._data["accounts"].get(email, {})
