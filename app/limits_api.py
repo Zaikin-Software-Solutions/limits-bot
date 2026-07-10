@@ -81,3 +81,20 @@ async def fetch_limits(url: str, token: str, *, timeout: float = 10.0) -> Limits
     if isinstance(data, dict) and data.get("error"):
         raise httpx.HTTPError(f"limits API error: {data['error']}")
     return LimitsResponse.model_validate(data)
+
+
+def _models_url(limits_url: str) -> str:
+    """Из .../v1/claude/limits собрать .../v1/models на том же хосте."""
+    base = limits_url.split("/v1/")[0]
+    return f"{base}/v1/models"
+
+
+async def fetch_models(limits_url: str, token: str, *, timeout: float = 10.0) -> list[tuple[str, str]]:
+    """Список (owned_by, id) доступных через прокси моделей."""
+    url = _models_url(limits_url)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+        resp.raise_for_status()
+        data = resp.json()
+    items = data.get("data", []) if isinstance(data, dict) else []
+    return [(m.get("owned_by", "?"), m.get("id", "?")) for m in items]

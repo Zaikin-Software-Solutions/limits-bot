@@ -9,7 +9,7 @@ resets_at), а не по «текущему моменту» — это усто
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .limits_api import Credential
@@ -49,6 +49,7 @@ def _parse_iso(s: str | None) -> datetime | None:
 
 
 def _fmt_delta(target: datetime | None) -> str:
+    """«2д 4ч» / «5ч 12м» / «43м» до цели."""
     if not target:
         return "неизвестно когда"
     delta = int((target - _now()).total_seconds())
@@ -58,10 +59,23 @@ def _fmt_delta(target: datetime | None) -> str:
     h, rem = divmod(rem, 3600)
     m = rem // 60
     if d:
-        return f"~{d}д {h}ч"
+        return f"{d}д {h}ч"
     if h:
-        return f"~{h}ч {m}м"
-    return f"~{m}м"
+        return f"{h}ч {m}м"
+    return f"{m}м"
+
+
+def _fmt_when(target: datetime | None) -> str:
+    """Абсолютная дата обнуления в МСК: «16 июля 04:00»."""
+    if not target:
+        return "?"
+    msk = timezone(timedelta(hours=3))
+    months = [
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря",
+    ]
+    local = target.astimezone(msk)
+    return f"{local.day} {months[local.month - 1]} {local.strftime('%H:%M')} МСК"
 
 
 def _crossed(prev: float | None, cur: float | None, threshold: float) -> bool:
@@ -143,12 +157,17 @@ def detect(
     if reset_by_drop or reset_by_window:
         was = f"{prev_7d:.0f}%" if prev_7d is not None else "?"
         now_pct = f"{cur_7d:.0f}%" if cur_7d is not None else "?"
+        next_reset = (
+            f"\nСледующее обнуление через {_fmt_delta(cur_reset)} ({_fmt_when(cur_reset)})."
+            if cur_reset
+            else ""
+        )
         events.append(
             Event(
                 "weekly_reset",
                 cred.email,
                 f"🔄 Недельный лимит обнулился ({name}). Было 7d:{was} → стало {now_pct}. "
-                f"Можно грузить по полной.",
+                f"Можно грузить по полной.{next_reset}",
             )
         )
         flags = {}  # новое окно — сбрасываем все edge-флаги
@@ -163,8 +182,8 @@ def detect(
                 Event(
                     "weekly_reset_soon",
                     cred.email,
-                    f"⏳ Недельный лимит обнулится {_fmt_delta(cur_reset)} ({name}). "
-                    f"Сейчас 7d:{pct}.",
+                    f"⏳ Недельный лимит обнулится через {_fmt_delta(cur_reset)} "
+                    f"({_fmt_when(cur_reset)}, {name}). Сейчас 7d:{pct}.",
                 )
             )
             flags[warn_key] = True
@@ -178,7 +197,7 @@ def detect(
                     "threshold_7d",
                     cred.email,
                     f"⚠️ Недельный лимит достиг {th}% ({name}). "
-                    f"Обнуление {_fmt_delta(cur_reset)}.",
+                    f"Обнуление через {_fmt_delta(cur_reset)} ({_fmt_when(cur_reset)}).",
                 )
             )
             flags[key_7d] = True
@@ -188,12 +207,13 @@ def detect(
         cur_5h = cur["five_hour_pct"]
         if _crossed(prev_5h, cur_5h, th) and not flags.get(key_5h):
             fh = cred.limits.five_hour
+            fh_reset = fh.resets_at if fh else None
             events.append(
                 Event(
                     "threshold_5h",
                     cred.email,
                     f"⚠️ 5-часовой лимит достиг {th}% ({name}). "
-                    f"Сброс {_fmt_delta(fh.resets_at if fh else None)}.",
+                    f"Сброс через {_fmt_delta(fh_reset)} ({_fmt_when(fh_reset)}).",
                 )
             )
             flags[key_5h] = True

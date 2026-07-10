@@ -6,6 +6,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommand
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .config import settings
@@ -24,6 +25,16 @@ async def main() -> None:
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
     dp.include_router(router)
+
+    # Команды в синем меню Telegram-клиента.
+    await bot.set_my_commands(
+        [
+            BotCommand(command="menu", description="Меню с кнопками"),
+            BotCommand(command="status", description="Текущие лимиты"),
+            BotCommand(command="next", description="Когда обнуление"),
+            BotCommand(command="models", description="Доступные модели"),
+        ]
+    )
 
     state = State(settings.state_path)
     state.load()

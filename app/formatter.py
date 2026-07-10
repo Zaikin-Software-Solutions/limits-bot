@@ -1,4 +1,4 @@
-"""Форматирование сообщений для команд /status и /next."""
+"""Форматирование сообщений для команд /status, /next, /models."""
 
 from __future__ import annotations
 
@@ -6,8 +6,12 @@ from datetime import datetime, timezone
 
 from .limits_api import Credential
 
+# Часовой пояс для человекочитаемых дат (МСК = UTC+3).
+MSK = timezone(__import__("datetime").timedelta(hours=3))
 
-def _fmt_delta(target: datetime | None) -> str:
+
+def fmt_countdown(target: datetime | None) -> str:
+    """«2д 4ч 30м» / «5ч 12м» / «43м» / «сейчас» до целевого времени."""
     if not target:
         return "?"
     delta = int((target - datetime.now(timezone.utc)).total_seconds())
@@ -16,15 +20,52 @@ def _fmt_delta(target: datetime | None) -> str:
     d, rem = divmod(delta, 86400)
     h, rem = divmod(rem, 3600)
     m = rem // 60
+    parts: list[str] = []
     if d:
-        return f"~{d}д {h}ч"
+        parts.append(f"{d}д")
     if h:
-        return f"~{h}ч {m}м"
-    return f"~{m}м"
+        parts.append(f"{h}ч")
+    if m and not d:  # минуты показываем только если < суток
+        parts.append(f"{m}м")
+    return " ".join(parts) or "меньше минуты"
+
+
+def fmt_when(target: datetime | None) -> str:
+    """Абсолютная дата обнуления в МСК: «16 июля 04:00»."""
+    if not target:
+        return "?"
+    months = [
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря",
+    ]
+    local = target.astimezone(MSK)
+    return f"{local.day} {months[local.month - 1]} {local.strftime('%H:%M')} МСК"
+
+
+def bar(pct: float | None, width: int = 10) -> str:
+    """Прогресс-бар [███░░░░░░░] по проценту утилизации."""
+    if pct is None:
+        return "░" * width
+    filled = int(round(pct / 100 * width))
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
 
 
 def _pct(v: float | None) -> str:
     return f"{v:.0f}%" if v is not None else "?"
+
+
+def _window_line(label: str, w) -> str:
+    """Строка окна: 5h [███░░░] 7% · осталось 93% · сброс через 5ч (16 июля 04:00)."""
+    util = w.utilization_pct
+    rem = w.remaining_pct
+    cd = fmt_countdown(w.resets_at)
+    when = fmt_when(w.resets_at)
+    rem_txt = f"осталось {_pct(rem)} · " if rem is not None else ""
+    return (
+        f"{label} {bar(util)} {_pct(util)}\n"
+        f"     {rem_txt}сброс через <b>{cd}</b> ({when})"
+    )
 
 
 def format_status(creds: list[Credential]) -> str:
@@ -32,35 +73,64 @@ def format_status(creds: list[Credential]) -> str:
         return "Нет аккаунтов в ответе API."
     lines: list[str] = []
     for c in creds:
-        fh = c.limits.five_hour
-        sd = c.limits.seven_day
-        lines.append(f"<b>{c.name}</b> · {c.plan or '?'}")
-        if fh:
-            lines.append(f"  5h:  {_pct(fh.utilization_pct)}  (сброс {_fmt_delta(fh.resets_at)})")
-        if sd:
-            lines.append(f"  7d:  {_pct(sd.utilization_pct)}  (сброс {_fmt_delta(sd.resets_at)})")
+        lines.append(f"<b>{c.name}</b> · {c.plan or '?'} ({c.rate_limit_tier or '?'})")
+        if c.limits.five_hour and c.limits.five_hour.utilization_pct is not None:
+            lines.append(_window_line("5h ", c.limits.five_hour))
+        if c.limits.seven_day and c.limits.seven_day.utilization_pct is not None:
+            lines.append(_window_line("7d ", c.limits.seven_day))
+        # раздельные недельные лимиты по моделям — если Anthropic их включит
+        if c.limits.seven_day_opus and c.limits.seven_day_opus.utilization_pct is not None:
+            lines.append(_window_line("7d Opus  ", c.limits.seven_day_opus))
+        if c.limits.seven_day_sonnet and c.limits.seven_day_sonnet.utilization_pct is not None:
+            lines.append(_window_line("7d Sonnet", c.limits.seven_day_sonnet))
         eu = c.extra_usage
         if eu.is_enabled and eu.utilization_pct is not None:
+            sym = eu.currency or ""
             lines.append(
-                f"  💸 overflow: {_pct(eu.utilization_pct)} "
-                f"({eu.used_credits:.0f}/{eu.monthly_limit:.0f} {eu.currency or ''})"
+                f"💸 overflow {bar(eu.utilization_pct)} {_pct(eu.utilization_pct)}\n"
+                f"     осталось {eu.remaining_credits:.0f} из {eu.monthly_limit:.0f} {sym}"
             )
         if c.quota.exceeded:
-            lines.append(f"  ⛔ квота исчерпана (восст. {_fmt_delta(c.quota.next_recover_at)})")
+            lines.append(f"⛔ квота исчерпана (восст. через {fmt_countdown(c.quota.next_recover_at)})")
         lines.append("")
+    if not any("5h" in ln or "7d" in ln for ln in lines):
+        lines.append("⏳ API временно отдаёт пустые лимиты (upstream rate-limit), попробуй позже.")
     return "\n".join(lines).strip()
 
 
 def format_next(creds: list[Credential]) -> str:
-    """Ближайшее по времени обнуление среди всех окон/аккаунтов."""
-    candidates: list[tuple[datetime, str]] = []
+    """Все окна обнуления, отсортированы по времени, с днями/часами."""
+    rows: list[tuple[datetime, str]] = []
     for c in creds:
-        if c.limits.five_hour and c.limits.five_hour.resets_at:
-            candidates.append((c.limits.five_hour.resets_at, f"5h · {c.name}"))
-        if c.limits.seven_day and c.limits.seven_day.resets_at:
-            candidates.append((c.limits.seven_day.resets_at, f"7d · {c.name}"))
-    if not candidates:
-        return "Нет данных о времени обнуления."
-    candidates.sort(key=lambda x: x[0])
-    when, label = candidates[0]
-    return f"Ближайшее обнуление: <b>{label}</b> через {_fmt_delta(when)}."
+        fh = c.limits.five_hour
+        sd = c.limits.seven_day
+        if fh and fh.resets_at:
+            rows.append((fh.resets_at, f"5h · {c.name}"))
+        if sd and sd.resets_at:
+            rows.append((sd.resets_at, f"7d · {c.name}"))
+        if c.limits.seven_day_opus and c.limits.seven_day_opus.resets_at:
+            rows.append((c.limits.seven_day_opus.resets_at, f"7d Opus · {c.name}"))
+        if c.limits.seven_day_sonnet and c.limits.seven_day_sonnet.resets_at:
+            rows.append((c.limits.seven_day_sonnet.resets_at, f"7d Sonnet · {c.name}"))
+    if not rows:
+        return "⏳ Нет данных о времени обнуления (API отдаёт пустышку). Попробуй позже."
+    rows.sort(key=lambda x: x[0])
+    out = ["<b>Обнуление окон:</b>"]
+    for when, label in rows:
+        out.append(f"• {label}: через <b>{fmt_countdown(when)}</b> ({fmt_when(when)})")
+    return "\n".join(out)
+
+
+def format_models(model_ids: list[tuple[str, str]]) -> str:
+    """Список моделей, сгруппированный по провайдеру. model_ids = [(owner, id), ...]."""
+    if not model_ids:
+        return "Не удалось получить список моделей."
+    by_owner: dict[str, list[str]] = {}
+    for owner, mid in sorted(model_ids):
+        by_owner.setdefault(owner, []).append(mid)
+    out = [f"<b>Доступно моделей: {len(model_ids)}</b>"]
+    for owner, ids in by_owner.items():
+        out.append(f"\n<b>{owner}</b>")
+        for mid in ids:
+            out.append(f"  • <code>{mid}</code>")
+    return "\n".join(out)
