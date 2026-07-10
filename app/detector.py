@@ -18,6 +18,12 @@ from .state import State
 # Насколько должен упасть 7d%, чтобы счесть это обнулением (а не обычным дрейфом).
 RESET_DROP_PCT = 15.0
 
+# Насколько должен сдвинуться resets_at вперёд, чтобы счесть это НОВЫМ окном.
+# Прокси пересчитывает resets_at от now при каждом кэш-цикле (TTL ~60с), поэтому
+# он дрейфует на секунды между ответами — это НЕ обнуление. Реальная смена
+# недельного окна двигает resets_at на ~7 дней. Порог 12ч отсекает дрейф.
+RESET_WINDOW_SHIFT_SECS = 12 * 3600
+
 
 @dataclass
 class Event:
@@ -63,6 +69,15 @@ def _fmt_delta(target: datetime | None) -> str:
     if h:
         return f"{h}ч {m}м"
     return f"{m}м"
+
+
+def _money(cents: float | None, currency: str | None) -> str:
+    """Центы → «$160.00» (extra_usage приходит в центах, не долларах)."""
+    if cents is None:
+        return "?"
+    if (currency or "").upper() == "USD":
+        return f"${cents / 100:,.2f}"
+    return f"{cents / 100:,.2f} {currency or ''}".rstrip()
 
 
 def _fmt_when(target: datetime | None) -> str:
@@ -134,7 +149,7 @@ def detect(
 
     events: list[Event] = []
     cur = snapshot_of(cred)
-    name = cred.name
+    name = cred.label
     flags: dict[str, Any] = dict(prev.get("notified_flags", {}))
 
     prev_7d = prev.get("seven_day_pct")
@@ -148,11 +163,16 @@ def detect(
         and cur_7d is not None
         and (prev_7d - cur_7d) >= RESET_DROP_PCT
     )
-    # окно сменилось: прошлый resets_at уже в прошлом ИЛИ новый resets_at позже прошлого
+    # окно реально сменилось: resets_at прыгнул вперёд на ≥ порога (не секундный
+    # дрейф от пересчёта прокси). Плюс это должно совпасть с падением утилизации —
+    # без спада «сдвиг вперёд» сам по себе не обнуление.
     reset_by_window = (
         prev_reset is not None
         and cur_reset is not None
-        and cur_reset > prev_reset
+        and (cur_reset - prev_reset).total_seconds() >= RESET_WINDOW_SHIFT_SECS
+        and cur_7d is not None
+        and prev_7d is not None
+        and cur_7d < prev_7d
     )
     if reset_by_drop or reset_by_window:
         was = f"{prev_7d:.0f}%" if prev_7d is not None else "?"
@@ -175,7 +195,9 @@ def detect(
     # ── Предупреждение «скоро обнулится» ───────────────────────────────────
     if cur_reset is not None:
         secs_left = (cur_reset - _now()).total_seconds()
-        warn_key = f"weekly_warn:{cur['seven_day_resets_at']}"
+        # Ключ по дате окна (без времени) — resets_at дрейфует по секундам между
+        # ответами прокси, иначе флаг «уже предупреждали» каждый раз новый.
+        warn_key = f"weekly_warn:{cur_reset.date().isoformat()}"
         if 0 < secs_left <= weekly_warn_hours * 3600 and not flags.get(warn_key):
             pct = f"{cur_7d:.0f}%" if cur_7d is not None else "?"
             events.append(
@@ -230,15 +252,15 @@ def detect(
         key_eu = f"extra:{int(extra_usage_warn_pct)}"
         prev_eu = prev.get("extra_usage_pct")
         if _crossed(prev_eu, eu.utilization_pct, extra_usage_warn_pct) and not flags.get(key_eu):
-            used = eu.used_credits or 0
-            limit = eu.monthly_limit or 0
-            cur_sym = eu.currency or ""
+            # extra_usage приходит в центах: monthly_limit=16000 → $160.00
+            used = _money(eu.used_credits, eu.currency)
+            limit = _money(eu.monthly_limit, eu.currency)
             events.append(
                 Event(
                     "extra_usage_high",
                     cred.email,
                     f"💸 Платный overflow достиг {eu.utilization_pct:.0f}% "
-                    f"({used:.0f}/{limit:.0f} {cur_sym}, {name}).",
+                    f"({used} из {limit}, {name}).",
                 )
             )
             flags[key_eu] = True

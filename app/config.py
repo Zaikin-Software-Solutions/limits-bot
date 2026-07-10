@@ -25,13 +25,18 @@ class Settings(BaseSettings):
     chat_id: int = Field(alias="CHAT_ID")
     allowed_user_ids_raw: str = Field(default="", alias="ALLOWED_USER_IDS")
 
-    # Источник лимитов
+    # Источник лимитов Claude
     limits_api_url: str = Field(
         default="https://rotate-proxy.rodionov.uk/v1/claude/limits",
         alias="LIMITS_API_URL",
     )
     limits_token: str = Field(alias="LIMITS_TOKEN")
     accounts_filter_raw: str = Field(default="", alias="ACCOUNTS_FILTER")
+
+    # Источник лимитов Codex (ChatGPT-подписка через CLIProxyAPI).
+    # Пусто = codex не мониторим. На ns1: http://127.0.0.1:8317/v1/codex/limits
+    codex_api_url: str = Field(default="", alias="CODEX_API_URL")
+    codex_token: str = Field(default="", alias="CODEX_TOKEN")
 
     # Поведение
     poll_interval_min: int = Field(default=30, alias="POLL_INTERVAL_MIN")

@@ -55,6 +55,16 @@ def _pct(v: float | None) -> str:
     return f"{v:.0f}%" if v is not None else "?"
 
 
+def fmt_money(cents: float | None, currency: str | None) -> str:
+    """extra_usage приходит в центах (monthly_limit=16000 → $160.00). Форматируем в $."""
+    if cents is None:
+        return "?"
+    sym = "$" if (currency or "").upper() == "USD" else ""
+    val = cents / 100
+    suffix = "" if sym else f" {currency or ''}".rstrip()
+    return f"{sym}{val:,.2f}{suffix}"
+
+
 def _window_line(label: str, w) -> str:
     """Строка окна: 5h [███░░░] 7% · осталось 93% · сброс через 5ч (16 июля 04:00)."""
     util = w.utilization_pct
@@ -73,7 +83,8 @@ def format_status(creds: list[Credential]) -> str:
         return "Нет аккаунтов в ответе API."
     lines: list[str] = []
     for c in creds:
-        lines.append(f"<b>{c.name}</b> · {c.plan or '?'} ({c.rate_limit_tier or '?'})")
+        tier = f" ({c.rate_limit_tier})" if c.rate_limit_tier else ""
+        lines.append(f"<b>{c.label}</b> · {c.plan or '?'}{tier}")
         if c.limits.five_hour and c.limits.five_hour.utilization_pct is not None:
             lines.append(_window_line("5h ", c.limits.five_hour))
         if c.limits.seven_day and c.limits.seven_day.utilization_pct is not None:
@@ -85,10 +96,11 @@ def format_status(creds: list[Credential]) -> str:
             lines.append(_window_line("7d Sonnet", c.limits.seven_day_sonnet))
         eu = c.extra_usage
         if eu.is_enabled and eu.utilization_pct is not None:
-            sym = eu.currency or ""
+            used = fmt_money(eu.used_credits, eu.currency)
+            limit = fmt_money(eu.monthly_limit, eu.currency)
             lines.append(
                 f"💸 overflow {bar(eu.utilization_pct)} {_pct(eu.utilization_pct)}\n"
-                f"     осталось {eu.remaining_credits:.0f} из {eu.monthly_limit:.0f} {sym}"
+                f"     потрачено {used} из {limit}"
             )
         if c.quota.exceeded:
             lines.append(f"⛔ квота исчерпана (восст. через {fmt_countdown(c.quota.next_recover_at)})")
@@ -105,13 +117,13 @@ def format_next(creds: list[Credential]) -> str:
         fh = c.limits.five_hour
         sd = c.limits.seven_day
         if fh and fh.resets_at:
-            rows.append((fh.resets_at, f"5h · {c.name}"))
+            rows.append((fh.resets_at, f"5h · {c.label}"))
         if sd and sd.resets_at:
-            rows.append((sd.resets_at, f"7d · {c.name}"))
+            rows.append((sd.resets_at, f"7d · {c.label}"))
         if c.limits.seven_day_opus and c.limits.seven_day_opus.resets_at:
-            rows.append((c.limits.seven_day_opus.resets_at, f"7d Opus · {c.name}"))
+            rows.append((c.limits.seven_day_opus.resets_at, f"7d Opus · {c.label}"))
         if c.limits.seven_day_sonnet and c.limits.seven_day_sonnet.resets_at:
-            rows.append((c.limits.seven_day_sonnet.resets_at, f"7d Sonnet · {c.name}"))
+            rows.append((c.limits.seven_day_sonnet.resets_at, f"7d Sonnet · {c.label}"))
     if not rows:
         return "⏳ Нет данных о времени обнуления (API отдаёт пустышку). Попробуй позже."
     rows.sort(key=lambda x: x[0])

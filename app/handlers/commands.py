@@ -7,7 +7,14 @@ import logging
 import httpx
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 
 from ..config import settings
 from ..formatter import format_models, format_next, format_status
@@ -18,7 +25,7 @@ router = Router()
 
 
 def _menu_kb() -> InlineKeyboardMarkup:
-    """Inline-меню с командами."""
+    """Inline-меню с командами (под сообщением)."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -27,9 +34,21 @@ def _menu_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="🤖 Модели", callback_data="cmd:models"),
-                InlineKeyboardButton(text="🔄 Обновить меню", callback_data="cmd:menu"),
+                InlineKeyboardButton(text="🔄 Обновить", callback_data="cmd:menu"),
             ],
         ]
+    )
+
+
+def _reply_kb() -> ReplyKeyboardMarkup:
+    """Постоянная клавиатура внизу поля ввода — кнопки-команды всегда под рукой."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📊 Статус"), KeyboardButton(text="⏰ Обнуление")],
+            [KeyboardButton(text="🤖 Модели"), KeyboardButton(text="☰ Меню")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -91,10 +110,11 @@ async def cmd_start(message: Message) -> None:
     if not _allowed_message(message):
         return
     await message.answer(
-        "Бот следит за лимитами Claude и шлёт push при обнулении недельного окна, "
-        "порогах утилизации, платном overflow и полной блокировке.\n\n"
-        "Нажми кнопку или используй команды:",
-        reply_markup=_menu_kb(),
+        "Бот следит за лимитами <b>Claude</b> и <b>Codex</b> и шлёт push при обнулении "
+        "недельного окна, порогах утилизации, платном overflow и полной блокировке.\n\n"
+        "Кнопки всегда внизу. Или /menu, /status, /next, /models.",
+        parse_mode="HTML",
+        reply_markup=_reply_kb(),
     )
 
 
@@ -102,10 +122,13 @@ async def cmd_start(message: Message) -> None:
 async def cmd_menu(message: Message) -> None:
     if not _allowed_message(message):
         return
-    await message.answer("Меню limits-bot:", reply_markup=_menu_kb())
+    # показываем и постоянную клавиатуру, и inline-меню
+    await message.answer("Меню limits-bot:", reply_markup=_reply_kb())
+    await message.answer("Выбери действие:", reply_markup=_menu_kb())
 
 
 @router.message(Command("status"))
+@router.message(F.text == "📊 Статус")
 async def cmd_status(message: Message) -> None:
     if not _allowed_message(message):
         return
@@ -113,6 +136,7 @@ async def cmd_status(message: Message) -> None:
 
 
 @router.message(Command("next"))
+@router.message(F.text == "⏰ Обнуление")
 async def cmd_next(message: Message) -> None:
     if not _allowed_message(message):
         return
@@ -120,10 +144,18 @@ async def cmd_next(message: Message) -> None:
 
 
 @router.message(Command("models"))
+@router.message(F.text == "🤖 Модели")
 async def cmd_models(message: Message) -> None:
     if not _allowed_message(message):
         return
     await message.answer(await _models_text(), parse_mode="HTML", reply_markup=_menu_kb())
+
+
+@router.message(F.text == "☰ Меню")
+async def btn_menu(message: Message) -> None:
+    if not _allowed_message(message):
+        return
+    await message.answer("Выбери действие:", reply_markup=_menu_kb())
 
 
 # ── Inline-кнопки ────────────────────────────────────────────────────────────
