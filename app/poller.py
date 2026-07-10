@@ -73,8 +73,13 @@ async def poll_once(bot: Bot, state: State) -> None:
         return
 
     for ev in all_events:
-        try:
-            await bot.send_message(settings.chat_id, ev.text)
-            log.info("sent %s for %s", ev.type, ev.email)
-        except Exception as e:  # noqa: BLE001 — не роняем поллер из-за одной отправки
-            log.error("send failed for %s: %s", ev.type, e)
+        # loud-события (обнуление лимита) — в канал И в личку каждому админу.
+        targets = [settings.chat_id]
+        if ev.loud:
+            targets += [uid for uid in settings.allowed_user_ids if uid not in targets]
+        for target in targets:
+            try:
+                await bot.send_message(target, ev.text, parse_mode="HTML")
+                log.info("sent %s for %s → %s", ev.type, ev.email, target)
+            except Exception as e:  # noqa: BLE001 — не роняем поллер из-за одной отправки
+                log.error("send failed for %s → %s: %s", ev.type, target, e)

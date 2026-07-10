@@ -15,7 +15,12 @@ from typing import Any
 from .limits_api import Credential
 from .state import State
 
-# Насколько должен упасть 7d%, чтобы счесть это обнулением (а не обычным дрейфом).
+# Обнуление к ~нулю: cur упал НЕ ВЫШЕ этого, а prev был ЗАМЕТНО выше.
+# Ловит любой реальный сброс — 7→0, 10→0, 90→0 — независимо от абсолютной величины.
+RESET_ZERO_CEIL = 2.0     # «стало ~ноль»: cur_7d ≤ 2%
+RESET_ZERO_MIN_PREV = 4.0  # «было заметно»: prev_7d ≥ 4% (иначе это шум у нуля)
+
+# Большой спад (не до нуля): например 90% → 40%. Тоже считаем обнулением.
 RESET_DROP_PCT = 15.0
 
 # Насколько должен сдвинуться resets_at вперёд, чтобы счесть это НОВЫМ окном.
@@ -30,6 +35,8 @@ class Event:
     type: str
     email: str
     text: str
+    # loud=True → яркое сообщение, дублируется в личку админам (обнуление лимита).
+    loud: bool = False
 
 
 def _now() -> datetime:
@@ -157,15 +164,30 @@ def detect(
     prev_reset = _parse_iso(prev.get("seven_day_resets_at"))
     cur_reset = _parse_iso(cur["seven_day_resets_at"])
 
+    # «Последнее заметное значение» — переживает рестарты и пустые ответы.
+    # Если бот перезапустился в момент, когда API уже отдаёт 0%, сравнение с
+    # обычным prev потеряло бы переход. peak_7d хранит макс. недавнее значение.
+    peak_7d = prev.get("peak_seven_day_pct")
+    baseline_high = max(
+        [v for v in (prev_7d, peak_7d) if v is not None], default=None
+    )
+
     # ── Недельное обнуление ────────────────────────────────────────────────
+    # 1) Падение к ~нулю: стало ≤2%, а было ≥4% (ловит 7→0, 10→0, 90→0).
+    reset_to_zero = (
+        cur_7d is not None
+        and cur_7d <= RESET_ZERO_CEIL
+        and baseline_high is not None
+        and baseline_high >= RESET_ZERO_MIN_PREV
+    )
+    # 2) Большой спад не до нуля: 90→40 и т.п.
     reset_by_drop = (
         prev_7d is not None
         and cur_7d is not None
         and (prev_7d - cur_7d) >= RESET_DROP_PCT
     )
-    # окно реально сменилось: resets_at прыгнул вперёд на ≥ порога (не секундный
-    # дрейф от пересчёта прокси). Плюс это должно совпасть с падением утилизации —
-    # без спада «сдвиг вперёд» сам по себе не обнуление.
+    # 3) Окно сдвинулось вперёд на ≥12ч (реальная смена недели) со спадом —
+    #    страховка на случай, когда % успел частично набежать до опроса.
     reset_by_window = (
         prev_reset is not None
         and cur_reset is not None
@@ -174,22 +196,24 @@ def detect(
         and prev_7d is not None
         and cur_7d < prev_7d
     )
-    if reset_by_drop or reset_by_window:
-        was = f"{prev_7d:.0f}%" if prev_7d is not None else "?"
+    if reset_to_zero or reset_by_drop or reset_by_window:
+        was_val = baseline_high if reset_to_zero else prev_7d
+        was = f"{was_val:.0f}%" if was_val is not None else "?"
         now_pct = f"{cur_7d:.0f}%" if cur_7d is not None else "?"
         next_reset = (
-            f"\nСледующее обнуление через {_fmt_delta(cur_reset)} ({_fmt_when(cur_reset)})."
+            f"Следующее обнуление через {_fmt_delta(cur_reset)} ({_fmt_when(cur_reset)})."
             if cur_reset
             else ""
         )
-        events.append(
-            Event(
-                "weekly_reset",
-                cred.email,
-                f"🔄 Недельный лимит обнулился ({name}). Было 7d:{was} → стало {now_pct}. "
-                f"Можно грузить по полной.{next_reset}",
-            )
-        )
+        # Яркое большое уведомление — недельный лимит важен.
+        text = (
+            f"🟢🟢🟢 <b>НЕДЕЛЬНЫЙ ЛИМИТ ОБНУЛИЛСЯ</b> 🟢🟢🟢\n\n"
+            f"{name}\n"
+            f"Было <b>7d: {was}</b> → стало <b>{now_pct}</b>\n"
+            f"✅ Можно грузить по полной!\n\n"
+            f"{next_reset}"
+        ).strip()
+        events.append(Event("weekly_reset", cred.email, text, loud=True))
         flags = {}  # новое окно — сбрасываем все edge-флаги
 
     # ── Предупреждение «скоро обнулится» ───────────────────────────────────
@@ -283,4 +307,13 @@ def detect(
         )
 
     cur["notified_flags"] = flags
+
+    # peak_seven_day_pct: макс. недавнее значение 7d, переживает рестарты/пустые
+    # ответы. После обнуления сбрасываем к текущему (началось новое окно).
+    if reset_to_zero or reset_by_drop or reset_by_window:
+        cur["peak_seven_day_pct"] = cur_7d
+    else:
+        candidates = [v for v in (peak_7d, cur_7d) if v is not None]
+        cur["peak_seven_day_pct"] = max(candidates) if candidates else None
+
     return events, cur
