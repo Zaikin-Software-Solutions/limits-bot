@@ -1,0 +1,9 @@
+# Оверлей для локальной сборки образа вместо тянуть из GHCR.
+# Использование:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+services:
+  limits-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: limits-bot:local

@@ -1,0 +1,22 @@
+.env
+.env.local
+*.pyc
+__pycache__/
+.venv/
+venv/
+.python-version
+.idea/
+.vscode/
+*.log
+data/
+*.json
+!.github/**/*.json
+.DS_Store
+
+# Python build artifacts
+*.egg-info/
+build/
+dist/
+
+# Local-only secrets
+*.local

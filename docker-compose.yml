@@ -1,0 +1,11 @@
+# Production compose: тянет готовый образ из GHCR.
+# Для локальной сборки: docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+services:
+  limits-bot:
+    image: ghcr.io/zaikin-software-solutions/limits-bot:latest
+    container_name: limits-bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
