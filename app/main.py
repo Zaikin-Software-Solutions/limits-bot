@@ -24,7 +24,10 @@ log = logging.getLogger("limits-bot")
 
 async def main() -> None:
     bot = Bot(token=settings.bot_token)
-    dp = Dispatcher()
+    state = State(settings.state_path)
+    state.load()
+    # Один общий State на планировщик и команды: иначе сохранение одного затрёт правки другого.
+    dp = Dispatcher(bot_state=state)
     dp.include_router(router)
 
     # Команды в меню + кнопка меню [☰] слева от поля ввода (всегда доступна).
@@ -35,13 +38,11 @@ async def main() -> None:
             BotCommand(command="next", description="Когда обнуление"),
             BotCommand(command="models", description="Доступные модели"),
             BotCommand(command="check", description="Проверить прокси и Claude"),
+            BotCommand(command="token", description="Дата обновления логина Claude"),
             BotCommand(command="myid", description="Показать мой user_id"),
         ]
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-
-    state = State(settings.state_path)
-    state.load()
 
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(

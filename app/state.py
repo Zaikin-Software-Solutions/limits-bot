@@ -60,3 +60,7 @@ class State:
 
     def health(self) -> dict[str, Any]:
         return self._data.setdefault("health", {})
+
+    def login(self) -> dict[str, Any]:
+        """Дата ручного обновления логина Claude и флаг отправленного напоминания."""
+        return self._data.setdefault("login", {})

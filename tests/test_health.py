@@ -1,13 +1,9 @@
-"""Checks for actionable auth failures and deduplicated health alerts."""
+"""Checks for actionable auth failures, deduplicated alerts and the per-model matrix."""
 
 from __future__ import annotations
 
-import json
 import os
-import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest.mock import patch
 
 import httpx
@@ -17,13 +13,13 @@ os.environ.setdefault("CHAT_ID", "123456")
 os.environ.setdefault("LIMITS_TOKEN", "test")
 
 from app.health import (  # noqa: E402
-    AuthExpiry,
     Check,
-    _expiry_alerts,
+    _is_chat_model,
     _update_check_state,
-    codex_auth_expiries,
+    format_models_report,
     format_report,
     probe_model,
+    probe_source_models,
 )
 
 
@@ -41,28 +37,58 @@ class _Client:
         return self.response
 
 
+def _resp(status: int, body: dict) -> httpx.Response:
+    return httpx.Response(
+        status, json=body,
+        request=httpx.Request("POST", "https://proxy.example/v1/chat/completions"),
+    )
+
+
 class ProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_auth_unavailable_503_is_actionable(self):
-        response = httpx.Response(
-            503,
-            json={"error": {"message": "auth_unavailable: no auth available"}},
-            request=httpx.Request("POST", "https://proxy.example/v1/chat/completions"),
-        )
+        response = _resp(503, {"error": {"message": "auth_unavailable: no auth available"}})
         with patch("app.health.httpx.AsyncClient", return_value=_Client(response)):
             check = await probe_model("Claude", "https://proxy.example/v1/claude/limits", "key", "model")
         self.assertFalse(check.ok)
         self.assertTrue(check.auth_failure)
-        self.assertNotIn("no auth available", format_report([check], [], None))
+        self.assertNotIn("no auth available", format_report([check]))
 
     async def test_real_completion_required(self):
-        response = httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "OK"}}]},
-            request=httpx.Request("POST", "https://proxy.example/v1/chat/completions"),
-        )
+        response = _resp(200, {"choices": [{"message": {"content": "OK"}}]})
         with patch("app.health.httpx.AsyncClient", return_value=_Client(response)):
             check = await probe_model("Claude", "https://proxy.example/v1/claude/limits", "key", "model")
         self.assertTrue(check.ok)
+
+    async def test_relaxed_accepts_empty_text_from_reasoning_model(self):
+        response = _resp(200, {"choices": [{"message": {"content": ""}}]})
+        with patch("app.health.httpx.AsyncClient", return_value=_Client(response)):
+            strict = await probe_model("m", "https://proxy.example/v1/x", "key", "m")
+            relaxed = await probe_model("m", "https://proxy.example/v1/x", "key", "m", relaxed=True)
+        self.assertFalse(strict.ok)
+        self.assertTrue(relaxed.ok)
+
+    async def test_matrix_skips_image_models_and_reports_each_model(self):
+        models = [("openai", "gpt-a"), ("openai", "gpt-image-2"), ("anthropic", "claude-b")]
+
+        async def fake_probe(name, url, token, model, *, relaxed=False):
+            return Check(name, model != "claude-b", "ok" if model != "claude-b" else "HTTP 503")
+
+        with patch("app.health.fetch_models", return_value=models), \
+             patch("app.health.probe_model", side_effect=fake_probe):
+            checks, error = await probe_source_models("https://p.example/v1/x", "key")
+        self.assertIsNone(error)
+        self.assertEqual([c.name for c in checks], ["claude-b", "gpt-a"])
+        text = format_models_report([("proxy", checks, None)])
+        self.assertIn("1/2 отвечают", text)
+        self.assertIn("❌ <code>claude-b</code>", text)
+
+    def test_image_models_are_not_chat_probed(self):
+        self.assertFalse(_is_chat_model("gpt-image-2.5"))
+        self.assertTrue(_is_chat_model("claude-sonnet-5-5"))
+
+    def test_unconfigured_source_is_reported_not_raised(self):
+        text = format_models_report([("proxy", [], "не настроен")])
+        self.assertIn("не настроен", text)
 
 
 class StateTests(unittest.TestCase):
@@ -82,25 +108,12 @@ class StateTests(unittest.TestCase):
             _update_check_state({}, "claude", Check("Claude", False, "авторизация", auth_failure=True)),
         )
 
-    def test_expiry_warning_deduplicates_and_renews(self):
+    def test_zsp_public_tracked_independently(self):
         history = {}
-        expiry = AuthExpiry("account", datetime.now(timezone.utc) + timedelta(hours=36))
-        self.assertEqual(len(_expiry_alerts(history, [expiry])), 1)
-        self.assertEqual(_expiry_alerts(history, [expiry]), [])
-        renewed = AuthExpiry("account", datetime.now(timezone.utc) + timedelta(hours=30))
-        self.assertEqual(len(_expiry_alerts(history, [renewed])), 1)
-
-    def test_auth_file_uses_expiry_metadata_without_exposing_tokens(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
-            Path(tmp, "codex.json").write_text(json.dumps({
-                "type": "codex", "email": "test@example.com", "expired": expires,
-                "access_token": "secret", "refresh_token": "secret",
-            }))
-            expiries, error = codex_auth_expiries(tmp)
-        self.assertIsNone(error)
-        self.assertEqual(expiries[0].name, "test@example.com")
-        self.assertNotIn("secret", format_report([], expiries, None))
+        _update_check_state(history, "zsp_public", Check("zsp", False, "HTTP 502"))
+        _update_check_state(history, "codex", Check("codex", True, "ok"))
+        self.assertEqual(history["zsp_public"]["fails"], 1)
+        self.assertEqual(history["codex"]["fails"], 0)
 
 
 if __name__ == "__main__":

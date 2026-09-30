@@ -1,26 +1,26 @@
-"""Live proxy probes, Claude status, and Codex OAuth expiry monitoring."""
+"""Live proxy probes (rodionov, zsp internal + public), Claude status, per-model matrix."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from html import escape
-from pathlib import Path
 from typing import Any
 
 import httpx
 from aiogram import Bot
 
 from .config import settings
-from .limits_api import _models_url
+from .limits_api import _models_url, fetch_models
+from .reauth import login_reminder, today_msk
 from .state import State
 
 log = logging.getLogger(__name__)
 CLAUDE_STATUS_URL = "https://status.claude.com/api/v2/summary.json"
+HEALTH_KEYS = ("claude", "status", "codex", "zsp_public")
+MODEL_PROBE_CONCURRENCY = 6
 
 
 @dataclass(frozen=True)
@@ -32,23 +32,28 @@ class Check:
     auth_failure: bool = False
 
 
-@dataclass(frozen=True)
-class AuthExpiry:
-    name: str
-    expires_at: datetime
-
-
 def _chat_url(limits_url: str) -> str:
     return _models_url(limits_url).removesuffix("/models") + "/chat/completions"
 
 
-async def probe_model(name: str, limits_url: str, token: str, model: str) -> Check:
-    """A real completion, since /models and /limits can work with dead OAuth."""
+def _is_chat_model(model_id: str) -> bool:
+    """Image models do not serve chat completions; probing them only costs money."""
+    return "image" not in model_id.lower()
+
+
+async def probe_model(
+    name: str, limits_url: str, token: str, model: str, *, relaxed: bool = False
+) -> Check:
+    """A real completion, since /models and /limits can work with dead OAuth.
+
+    relaxed=True accepts any well-formed 200 with choices: reasoning models can
+    spend the tiny token budget before emitting text and are still alive.
+    """
     if not limits_url or not token or not model:
         return Check(name, None, "не настроен")
     started = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
                 _chat_url(limits_url),
                 headers={"Authorization": f"Bearer {token}"},
@@ -71,6 +76,10 @@ async def probe_model(name: str, limits_url: str, token: str, model: str) -> Che
             return Check(name, False, reason, latency, auth_failure)
         payload = response.json()
         choices = payload.get("choices", [])
+        if relaxed:
+            if choices:
+                return Check(name, True, "отвечает", latency)
+            return Check(name, False, "пустой ответ модели", latency)
         content = choices[0].get("message", {}).get("content") if choices else None
         if not content:
             return Check(name, False, "пустой ответ модели", latency)
@@ -99,33 +108,24 @@ async def check_claude_status() -> Check:
         return Check("Claude Status", None, "статус недоступен")
 
 
-def codex_auth_expiries(auth_dir: str) -> tuple[list[AuthExpiry], str | None]:
-    """Read only expiry metadata; the OAuth access token may auto-refresh."""
-    if not auth_dir:
-        return [], "проверка срока токена не настроена"
-    directory = Path(auth_dir)
-    if not directory.is_dir():
-        return [], "каталог авторизации недоступен"
-    result: list[AuthExpiry] = []
+async def probe_source_models(
+    limits_url: str, token: str
+) -> tuple[list[Check], str | None]:
+    """Probe every chat model a proxy advertises. Returns (checks, error)."""
+    if not limits_url or not token:
+        return [], "не настроен"
     try:
-        paths = list(directory.glob("*.json"))
-        for path in paths:
-            try:
-                data = json.loads(path.read_text("utf-8"))
-                if data.get("type") != "codex" or data.get("disabled") is True:
-                    continue
-                raw = data.get("expired")
-                if not isinstance(raw, str):
-                    continue
-                expires = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                if expires.tzinfo is None:
-                    expires = expires.replace(tzinfo=timezone.utc)
-                result.append(AuthExpiry(str(data.get("email") or path.stem), expires))
-            except (OSError, ValueError, TypeError):
-                log.warning("invalid Codex auth metadata in %s", path.name)
-    except OSError:
-        return [], "каталог авторизации недоступен"
-    return result, None if result else "активных Codex auth-файлов со сроком нет"
+        models = await fetch_models(limits_url, token)
+    except (httpx.HTTPError, ValueError):
+        return [], "список моделей недоступен"
+    ids = sorted({model_id for _, model_id in models if _is_chat_model(model_id)})
+    semaphore = asyncio.Semaphore(MODEL_PROBE_CONCURRENCY)
+
+    async def one(model_id: str) -> Check:
+        async with semaphore:
+            return await probe_model(model_id, limits_url, token, model_id, relaxed=True)
+
+    return list(await asyncio.gather(*(one(model_id) for model_id in ids))), None
 
 
 def format_check(check: Check) -> str:
@@ -134,8 +134,7 @@ def format_check(check: Check) -> str:
     return f"{icon} <b>{escape(check.name)}</b>: {escape(check.detail)}{latency}"
 
 
-def format_report(checks: list[Check], expiries: list[AuthExpiry], auth_error: str | None,
-                  history: dict[str, Any] | None = None) -> str:
+def format_report(checks: list[Check], history: dict[str, Any] | None = None) -> str:
     lines = ["🔎 <b>Проверка соединения</b>", "", *(format_check(c) for c in checks)]
     if history:
         samples = history.get("claude", {}).get("samples", [])
@@ -146,31 +145,51 @@ def format_report(checks: list[Check], expiries: list[AuthExpiry], auth_error: s
             else:
                 verdict = "стабилен за 6 опросов" if good == 6 else "были сбои за 6 опросов"
             lines.append(f"📈 Claude: {good}/{len(samples)} успешных · {verdict}")
-    if expiries:
-        lines.append("")
-        for item in expiries:
-            hours = (item.expires_at - datetime.now(timezone.utc)).total_seconds() / 3600
-            when = item.expires_at.astimezone(timezone.utc).strftime("%d.%m %H:%M UTC")
-            lines.append(
-                f"🔑 Codex {escape(item.name)}: срок OAuth-токена {when} "
-                f"({'истёк' if hours <= 0 else f'через {hours:.0f} ч'})"
-            )
-    elif auth_error:
-        lines.extend(["", f"❔ Codex OAuth: {escape(auth_error)}"])
     lines.extend(["", "<a href=\"https://status.claude.com/\">Claude Status</a>"])
     return "\n".join(lines)
 
 
-async def run_checks() -> tuple[list[Check], list[AuthExpiry], str | None]:
-    claude, status, codex = await asyncio.gather(
-        probe_model("AI Proxy → Claude", settings.limits_api_url, settings.limits_token,
+def format_models_report(sections: list[tuple[str, list[Check], str | None]]) -> str:
+    lines = ["🤖 <b>Статус моделей</b> (реальный запрос к каждой)"]
+    for title, checks, error in sections:
+        lines.append("")
+        if error:
+            lines.append(f"<b>{escape(title)}</b>: ❔ {escape(error)}")
+            continue
+        good = sum(check.ok is True for check in checks)
+        lines.append(f"<b>{escape(title)}</b> — {good}/{len(checks)} отвечают")
+        for check in checks:
+            if check.ok:
+                tail = f"{check.latency_ms} мс" if check.latency_ms is not None else "ok"
+                lines.append(f"✅ <code>{escape(check.name)}</code> · {tail}")
+            else:
+                lines.append(f"❌ <code>{escape(check.name)}</code> · {escape(check.detail)}")
+    return "\n".join(lines)
+
+
+async def run_checks() -> list[Check]:
+    claude, status, codex, zsp_public = await asyncio.gather(
+        probe_model("rodionov → Claude", settings.limits_api_url, settings.limits_token,
                     settings.claude_probe_model),
         check_claude_status(),
-        probe_model("Codex", settings.codex_api_url, settings.codex_token,
+        probe_model("zsp (внутренний) → Codex", settings.codex_api_url, settings.codex_token,
+                    settings.codex_probe_model),
+        probe_model("zsp (публичный) → Codex", settings.zsp_public_url, settings.codex_token,
                     settings.codex_probe_model),
     )
-    expiries, auth_error = codex_auth_expiries(settings.codex_auth_dir)
-    return [claude, status, codex], expiries, auth_error
+    return [claude, status, codex, zsp_public]
+
+
+async def run_model_matrix() -> list[tuple[str, list[Check], str | None]]:
+    """Per-model status for the two proxies users reach over the internet."""
+    (rodionov, rodionov_err), (zsp, zsp_err) = await asyncio.gather(
+        probe_source_models(settings.limits_api_url, settings.limits_token),
+        probe_source_models(settings.zsp_public_url, settings.codex_token),
+    )
+    return [
+        ("🟣 rotate-proxy rodionov", rodionov, rodionov_err),
+        ("🟠 rotate-proxy zsp", zsp, zsp_err),
+    ]
 
 
 def _update_check_state(history: dict[str, Any], key: str, check: Check) -> str | None:
@@ -197,35 +216,20 @@ def _update_check_state(history: dict[str, Any], key: str, check: Check) -> str 
     return None
 
 
-def _expiry_alerts(history: dict[str, Any], expiries: list[AuthExpiry]) -> list[str]:
-    warned = history.setdefault("codex_expiry_warned", {})
-    alerts = []
-    for item in expiries:
-        hours = (item.expires_at - datetime.now(timezone.utc)).total_seconds() / 3600
-        if hours > settings.codex_reauth_warn_hours:
-            continue
-        key = f"{item.name}:{item.expires_at.isoformat()}"
-        if warned.get(item.name) == key:
-            continue
-        warned[item.name] = key
-        if hours <= 0:
-            text = "OAuth-токен истёк; проверь работу Codex и повтори вход при ошибке"
-        else:
-            text = (f"до срока OAuth-токена {hours:.0f} ч; он может обновиться автоматически. "
-                    "Проверь повторный вход, если OpenAI его запросит")
-        alerts.append(f"🔑 <b>Codex {escape(item.name)}</b>: {text}.")
-    return alerts
-
-
 async def poll_health_once(bot: Bot, state: State) -> None:
-    checks, expiries, _ = await run_checks()
+    checks = await run_checks()
     history = state.health()
     alerts = []
-    for key, check in zip(("claude", "status", "codex"), checks, strict=True):
+    for key, check in zip(HEALTH_KEYS, checks, strict=True):
         alert = _update_check_state(history, key, check)
         if alert:
             alerts.append(alert)
-    alerts.extend(_expiry_alerts(history, expiries))
+    reminder = login_reminder(
+        state.login(), today_msk(), settings.claude_login_period_days,
+        settings.claude_login_warn_days,
+    )
+    if reminder:
+        alerts.append(reminder)
     state.save()
     for alert in alerts:
         for target in [settings.chat_id, *settings.allowed_user_ids]:

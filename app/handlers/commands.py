@@ -6,13 +6,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from datetime import date, timedelta
 
 import httpx
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -22,8 +25,15 @@ from aiogram.types import (
 
 from ..config import settings
 from ..formatter import format_models_split, format_next, format_status
-from ..health import format_report, run_checks
+from ..health import format_models_report, format_report, run_checks, run_model_matrix
 from ..limits_api import Credential, fetch_limits, fetch_models
+from ..reauth import (
+    format_status as format_login_status,
+    login_status,
+    parse_date,
+    set_last_login,
+    today_msk,
+)
 from ..state import State
 
 log = logging.getLogger(__name__)
@@ -48,6 +58,7 @@ def _menu_kb() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="🤖 Модели", callback_data="cmd:models:all"),
                 InlineKeyboardButton(text="🔎 Проверка", callback_data="cmd:check:all"),
+                InlineKeyboardButton(text="🔑 Токен", callback_data="cmd:token:all"),
             ],
             [InlineKeyboardButton(text="🔄 Обновить", callback_data="cmd:menu:all")],
         ]
@@ -60,11 +71,50 @@ def _reply_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📊 Статус"), KeyboardButton(text="⏰ Обнуление")],
             [KeyboardButton(text="🤖 Модели"), KeyboardButton(text="☰ Меню")],
-            [KeyboardButton(text="🔎 Проверка")],
+            [KeyboardButton(text="🔎 Проверка"), KeyboardButton(text="🔑 Токен")],
         ],
         resize_keyboard=True,
         is_persistent=True,
     )
+
+
+GRID_DAYS = 28  # период логина 30 дней: последние 28 дней покрывают реальные случаи
+ASK_PREFIX = "✏️ Введи дату обновления логина"
+
+
+def _token_kb() -> InlineKeyboardMarkup:
+    """Быстрый выбор даты обновления логина Claude."""
+    def ago(days: int, title: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(text=title, callback_data=f"tok:ago:{days}")
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [ago(0, "✅ Обновил сегодня"), ago(1, "Вчера")],
+            [ago(2, "2 дн. назад"), ago(3, "3 дн."), ago(7, "Неделю назад")],
+            [
+                InlineKeyboardButton(text="📅 Выбрать дату", callback_data="tok:pick"),
+                InlineKeyboardButton(text="✏️ Ввести вручную", callback_data="tok:ask"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Меню", callback_data="cmd:menu:all")],
+        ]
+    )
+
+
+def _date_grid_kb(today: date) -> InlineKeyboardMarkup:
+    """Сетка последних GRID_DAYS дней, по 4 в ряд; свежие даты сверху."""
+    buttons = [
+        InlineKeyboardButton(
+            text=(today - timedelta(days=n)).strftime("%d.%m"),
+            callback_data=f"tok:d:{(today - timedelta(days=n)).isoformat()}",
+        )
+        for n in range(GRID_DAYS)
+    ]
+    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    rows.append([
+        InlineKeyboardButton(text="✏️ Ввести вручную", callback_data="tok:ask"),
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="cmd:token:all"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ── Доступ ───────────────────────────────────────────────────────────────────
@@ -138,11 +188,28 @@ async def _models_text() -> str:
     return format_models_split(rodionov, zspzvs)
 
 
-async def _check_text() -> str:
-    checks, expiries, auth_error = await run_checks()
-    state = State(settings.state_path)
-    state.load()
-    return format_report(checks, expiries, auth_error, state.health())
+def _login_text(state: State) -> str:
+    status = login_status(state.login(), today_msk(), settings.claude_login_period_days)
+    return format_login_status(status)
+
+
+def _save_login(state: State, value: date) -> str:
+    """Записать дату обновления и вернуть текст подтверждения."""
+    set_last_login(state.login(), value)
+    state.save()
+    return (
+        "✅ Сохранено.\n" + _login_text(state)
+        + f"\nНапоминание придёт за {settings.claude_login_warn_days} дн. до срока."
+    )
+
+
+async def _check_text(state: State) -> str:
+    checks, matrix = await asyncio.gather(run_checks(), run_model_matrix())
+    return (
+        format_report(checks, state.health())
+        + "\n\n" + format_models_report(matrix)
+        + "\n\n" + _login_text(state)
+    )
 
 
 # ── Команды ──────────────────────────────────────────────────────────────────
@@ -210,10 +277,61 @@ async def cmd_models(message: Message) -> None:
 
 @router.message(Command("check"))
 @router.message(F.text == "🔎 Проверка")
-async def cmd_check(message: Message) -> None:
+async def cmd_check(message: Message, bot_state: State) -> None:
     if not _allowed_message(message):
         return
-    await message.answer(await _check_text(), parse_mode="HTML", reply_markup=_menu_kb())
+    await message.answer(
+        await _check_text(bot_state), parse_mode="HTML", reply_markup=_menu_kb()
+    )
+
+
+@router.message(Command("token"))
+@router.message(F.text == "🔑 Токен")
+async def cmd_token(message: Message, bot_state: State, command: CommandObject | None = None) -> None:
+    """/token — показать срок; /token 25.09.2026 | сегодня | вчера — задать дату обновления."""
+    if not _allowed_message(message):
+        return
+    args = (command.args or "").strip() if command else ""
+    if not args:
+        await message.answer(
+            _login_text(bot_state) + "\n\nЗадать дату: <code>/token ДД.ММ.ГГГГ</code>, "
+            "<code>/token сегодня</code> или <code>/token вчера</code>",
+            parse_mode="HTML",
+            reply_markup=_token_kb(),
+        )
+        return
+    try:
+        value = parse_date(args, today_msk())
+    except ValueError as exc:
+        await message.answer(
+            f"❌ {exc}. Примеры: <code>/token 25.09.2026</code>, <code>/token 2026-09-25</code>, "
+            "<code>/token сегодня</code>",
+            parse_mode="HTML",
+        )
+        return
+    await message.answer(
+        _save_login(bot_state, value), parse_mode="HTML", reply_markup=_menu_kb()
+    )
+
+
+@router.message(F.reply_to_message.text.startswith(ASK_PREFIX))
+async def on_token_reply(message: Message, bot_state: State) -> None:
+    """Ответ на запрос «Введи дату» после кнопки «✏️ Ввести вручную»."""
+    if not _allowed_message(message):
+        return
+    try:
+        value = parse_date(message.text or "", today_msk())
+    except ValueError as exc:
+        await message.answer(
+            f"❌ {exc}. Нажми «✏️ Ввести вручную» и отправь дату ещё раз, например "
+            "<code>25.09.2026</code>.",
+            parse_mode="HTML",
+            reply_markup=_token_kb(),
+        )
+        return
+    await message.answer(
+        _save_login(bot_state, value), parse_mode="HTML", reply_markup=_menu_kb()
+    )
 
 
 @router.message(F.text == "☰ Меню")
@@ -226,7 +344,7 @@ async def btn_menu(message: Message) -> None:
 # ── Inline-кнопки: cmd:<action>:<scope> ──────────────────────────────────────
 
 @router.callback_query(F.data.startswith("cmd:"))
-async def on_menu_click(cb: CallbackQuery) -> None:
+async def on_menu_click(cb: CallbackQuery, bot_state: State) -> None:
     ok = _allowed_chat(cb.message.chat.id) if cb.message else False
     if not ok and not _allowed_user(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
@@ -246,9 +364,60 @@ async def on_menu_click(cb: CallbackQuery) -> None:
     elif action == "models":
         text = await _models_text()
     elif action == "check":
-        text = await _check_text()
+        text = await _check_text(bot_state)
+    elif action == "token":
+        text = _login_text(bot_state) + "\n\nКогда ты последний раз обновлял логин?"
     else:
         text = "Неизвестная команда."
 
     if cb.message:
-        await cb.message.answer(text, parse_mode="HTML", reply_markup=_menu_kb())
+        markup = _token_kb() if action == "token" else _menu_kb()
+        await cb.message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+# ── Inline-кнопки даты логина: tok:<ago|d|pick|ask>[:arg] ────────────────────
+
+@router.callback_query(F.data.startswith("tok:"))
+async def on_token_click(cb: CallbackQuery, bot_state: State) -> None:
+    # Запись меняет состояние, поэтому только для пользователей из ALLOWED_USER_IDS.
+    if not _allowed_user(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    await cb.answer()
+    if not cb.message:
+        return
+    parts = (cb.data or "").split(":", 2)
+    action = parts[1] if len(parts) > 1 else ""
+    arg = parts[2] if len(parts) > 2 else ""
+    today = today_msk()
+
+    if action == "pick":
+        await cb.message.answer(
+            "📅 Выбери дату обновления логина:", reply_markup=_date_grid_kb(today)
+        )
+        return
+    if action == "ask":
+        await cb.message.answer(
+            f"{ASK_PREFIX} ответом на это сообщение. Формат: "
+            "<code>25.09.2026</code>, <code>25.09</code> или <code>2026-09-25</code>.",
+            parse_mode="HTML",
+            reply_markup=ForceReply(input_field_placeholder="ДД.ММ.ГГГГ", selective=True),
+        )
+        return
+
+    try:
+        if action == "ago":
+            value = today - timedelta(days=int(arg))
+        elif action == "d":
+            value = date.fromisoformat(arg)
+        else:
+            raise ValueError
+    except (ValueError, OverflowError):
+        await cb.message.answer("❌ Кнопка устарела, выбери дату заново.", reply_markup=_token_kb())
+        return
+    if value > today:
+        await cb.message.answer("❌ Дата в будущем.", reply_markup=_token_kb())
+        return
+    await cb.message.answer(
+        _save_login(bot_state, value), parse_mode="HTML", reply_markup=_menu_kb()
+    )
