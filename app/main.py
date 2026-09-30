@@ -11,6 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .config import settings
 from .handlers import router
+from .health import poll_health_once
 from .poller import poll_once
 from .state import State
 
@@ -33,6 +34,7 @@ async def main() -> None:
             BotCommand(command="status", description="Текущие лимиты"),
             BotCommand(command="next", description="Когда обнуление"),
             BotCommand(command="models", description="Доступные модели"),
+            BotCommand(command="check", description="Проверить прокси и Claude"),
             BotCommand(command="myid", description="Показать мой user_id"),
         ]
     )
@@ -51,9 +53,19 @@ async def main() -> None:
         max_instances=1,
         coalesce=True,
     )
+    scheduler.add_job(
+        poll_health_once,
+        "interval",
+        minutes=settings.health_poll_interval_min,
+        args=(bot, state),
+        id="poll_health",
+        max_instances=1,
+        coalesce=True,
+    )
 
     # Первый опрос сразу на старте (зафиксирует baseline, если снапшота нет).
     await poll_once(bot, state)
+    await poll_health_once(bot, state)
     scheduler.start()
 
     log.info(

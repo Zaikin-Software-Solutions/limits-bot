@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # Пусто = codex не мониторим. На ns1: http://127.0.0.1:8317/v1/codex/limits
     codex_api_url: str = Field(default="", alias="CODEX_API_URL")
     codex_token: str = Field(default="", alias="CODEX_TOKEN")
+    codex_auth_dir: str = Field(default="", alias="CODEX_AUTH_DIR")
+
+    # Живые пробы: /models и /limits не выявляют умершую OAuth-сессию.
+    claude_probe_model: str = Field(default="claude-sonnet-5-5", alias="CLAUDE_PROBE_MODEL")
+    codex_probe_model: str = Field(default="gpt-6-luna", alias="CODEX_PROBE_MODEL")
+    health_poll_interval_min: int = Field(default=10, alias="HEALTH_POLL_INTERVAL_MIN")
+    codex_reauth_warn_hours: float = Field(default=48, alias="CODEX_REAUTH_WARN_HOURS")
 
     # Поведение
     poll_interval_min: int = Field(default=30, alias="POLL_INTERVAL_MIN")

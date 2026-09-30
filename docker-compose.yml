@@ -9,3 +9,7 @@ services:
       - .env
     volumes:
       - ./data:/data
+      # Read-only OAuth metadata for the 48h expiry warning.
+      - ${CODEX_AUTH_HOST_DIR:-./codex-auth}:/codex-auth:ro
+    environment:
+      CODEX_AUTH_DIR: /codex-auth

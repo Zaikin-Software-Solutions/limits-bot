@@ -22,7 +22,9 @@ from aiogram.types import (
 
 from ..config import settings
 from ..formatter import format_models_split, format_next, format_status
+from ..health import format_report, run_checks
 from ..limits_api import Credential, fetch_limits, fetch_models
+from ..state import State
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -45,8 +47,9 @@ def _menu_kb() -> InlineKeyboardMarkup:
             row("next", "⏰ Обнуление"),
             [
                 InlineKeyboardButton(text="🤖 Модели", callback_data="cmd:models:all"),
-                InlineKeyboardButton(text="🔄 Обновить", callback_data="cmd:menu:all"),
+                InlineKeyboardButton(text="🔎 Проверка", callback_data="cmd:check:all"),
             ],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="cmd:menu:all")],
         ]
     )
 
@@ -57,6 +60,7 @@ def _reply_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📊 Статус"), KeyboardButton(text="⏰ Обнуление")],
             [KeyboardButton(text="🤖 Модели"), KeyboardButton(text="☰ Меню")],
+            [KeyboardButton(text="🔎 Проверка")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -134,6 +138,13 @@ async def _models_text() -> str:
     return format_models_split(rodionov, zspzvs)
 
 
+async def _check_text() -> str:
+    checks, expiries, auth_error = await run_checks()
+    state = State(settings.state_path)
+    state.load()
+    return format_report(checks, expiries, auth_error, state.health())
+
+
 # ── Команды ──────────────────────────────────────────────────────────────────
 
 @router.message(Command("myid"))
@@ -197,6 +208,14 @@ async def cmd_models(message: Message) -> None:
     await message.answer(await _models_text(), parse_mode="HTML", reply_markup=_menu_kb())
 
 
+@router.message(Command("check"))
+@router.message(F.text == "🔎 Проверка")
+async def cmd_check(message: Message) -> None:
+    if not _allowed_message(message):
+        return
+    await message.answer(await _check_text(), parse_mode="HTML", reply_markup=_menu_kb())
+
+
 @router.message(F.text == "☰ Меню")
 async def btn_menu(message: Message) -> None:
     if not _allowed_message(message):
@@ -226,6 +245,8 @@ async def on_menu_click(cb: CallbackQuery) -> None:
         text = await _next_text(scope)
     elif action == "models":
         text = await _models_text()
+    elif action == "check":
+        text = await _check_text()
     else:
         text = "Неизвестная команда."
 

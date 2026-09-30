@@ -9,6 +9,7 @@ venv/
 .vscode/
 *.log
 data/
+codex-auth/
 *.json
 !.github/**/*.json
 .DS_Store

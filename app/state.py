@@ -57,3 +57,6 @@ class State:
 
     def set_account(self, email: str, data: dict[str, Any]) -> None:
         self._data["accounts"][email] = data
+
+    def health(self) -> dict[str, Any]:
+        return self._data.setdefault("health", {})
